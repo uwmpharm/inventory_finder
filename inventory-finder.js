@@ -114,172 +114,37 @@ function showIdle() {
 }
 
 /* ─────────────────────────────────────────────
-   SUPABASE QUERIES
-───────────────────────────────────────────── */
-async function queryInventory(query, site) {
-  debugLog('iv-query', `${site} / "${query}"`);
-  const { data, error } = await sb
-    .from('wms_iv_f')
-    .select('item,item_description,package_code,actual_location,type_description')
-    .eq('pharmacy', site)
-    .or(`item_description.ilike.%${query}%,item.ilike.%${query}%`)
-    .limit(50);
-  if (error) throw new Error(`wms_iv_f: ${error.message}`);
-  debugLog('iv-rows', data.length);
-  return data;
-}
-
-async function queryLocation(query, site) {
-  debugLog('lc-query', `${site} / "${query}"`);
-  const { data, error } = await sb
-    .from('wms_lc_f')
-    .select('location,forward_pick_item,type_description')
-    .eq('pharmacy', site)
-    .ilike('forward_pick_item', `%${query}%`)
-    .limit(50);
-  if (error) throw new Error(`wms_lc_f: ${error.message}`);
-  debugLog('lc-rows', data.length);
-  return data;
-}
-
-async function queryPyxisByExternalItem(query, system) {
-  debugLog('ext-query', `${system} / "${query}"`);
-  const { data, error } = await sb
-    .from('dms_extsys_item_valid')
-    .select('item,item_description,external_item')
-    .ilike('external_item', `%${query}%`)
-    .eq('external_system_name', system)
-    .eq('active', 1)
-    .limit(20);
-  if (error) throw new Error(`dms_extsys_item_valid: ${error.message}`);
-  debugLog('ext-rows', data.length);
-  return data;
-}
-
-async function batchGetPyxisIds(items, system) {
-  if (!items.length) return {};
-  const { data, error } = await sb
-    .from('dms_extsys_item_valid')
-    .select('item,external_item')
-    .in('item', items)
-    .eq('external_system_name', system)
-    .eq('active', 1)
-    .limit(500);
-  if (error) { debugLog('pyxis-batch-err', error.message); return {}; }
-  const map = {};
-  for (const r of (data || [])) if (!map[r.item]) map[r.item] = r.external_item;
-  return map;
-}
-
-async function batchGetExtDetails(items, system) {
-  if (!items.length) return {};
-  const { data, error } = await sb
-    .from('dms_extsys_item_valid')
-    .select('item,item_description,external_item_uom')
-    .in('item', items)
-    .eq('external_system_name', system)
-    .eq('active', 1)
-    .limit(500);
-  if (error) { debugLog('ext-detail-err', error.message); return {}; }
-  const map = {};
-  for (const r of (data || [])) if (!map[r.item]) map[r.item] = r;
-  return map;
-}
-
-async function batchGetInventoryByItems(items, site) {
-  if (!items.length) return {};
-  const { data, error } = await sb
-    .from('wms_iv_f')
-    .select('item,item_description,package_code,actual_location,type_description')
-    .eq('pharmacy', site)
-    .in('item', items)
-    .limit(50);
-  if (error) { debugLog('iv-batch-err', error.message); return {}; }
-  const map = {};
-  for (const r of (data || [])) map[r.item] = r;
-  return map;
-}
-
-/* ─────────────────────────────────────────────
-   WATERFALL SEARCH
+   FUZZY WATERFALL SEARCH
 ───────────────────────────────────────────── */
 async function performSearch(query) {
   if (!currentSite) return;
   const area = document.getElementById('results-area');
   area.innerHTML = '<div class="loading-state"><div class="spinner"></div><p>Searching inventory…</p></div>';
-  debugLog('SEARCH', `"${query}" @ ${currentSite}`);
+  
+  // Critical validation check for debugging trailing white spaces or case mismatches
+  debugLog('SEARCH-START', `"${query}" @ "${currentSite}" (Length: ${currentSite.length})`);
 
   try {
-    const system  = SITE_SYSTEM_MAP[currentSite];
-    let   results = [];
+    // Fire the remote procedure call configured inside Supabase
+    const { data, error } = await sb.rpc('fuzzy_search_inventory', {
+      search_text: query,
+      site_filter: currentSite
+    });
 
-    // ── Step 1: primary inventory table ──
-    const ivRows = await queryInventory(query, currentSite);
+    if (error) throw new Error(`Database Error: ${error.message}`);
+    
+    debugLog('DB-RESPONSE-ROWS', data ? data.length : 0);
+    
+    const results = (data || []).map(row => ({
+      source: row.location_type.toLowerCase(),
+      item: row.item_id,
+      item_description: row.item_description,
+      package_code: row.uom || '',
+      location: row.location || row.actual_location,
+      type_description: row.location_type,
+      pyxis_id: row.pyxis_id || null
+    }));
 
-    if (ivRows.length > 0) {
-      const pyxisMap = await batchGetPyxisIds(ivRows.map(r => r.item), system);
-      for (const row of ivRows) {
-        results.push({
-          source:           'inventory',
-          item:             row.item,
-          item_description: row.item_description,
-          package_code:     row.package_code,
-          location:         row.actual_location,
-          type_description: row.type_description,
-          pyxis_id:         pyxisMap[row.item] || null,
-        });
-      }
-
-    } else {
-      // ── Step 2: location table fallback ──
-      debugLog('fallback', 'trying wms_lc_f');
-      const lcRows = await queryLocation(query, currentSite);
-
-      if (lcRows.length > 0) {
-        const items = [...new Set(lcRows.map(r => r.forward_pick_item).filter(Boolean))];
-        const [pyxisMap, extMap] = await Promise.all([
-          batchGetPyxisIds(items, system),
-          batchGetExtDetails(items, system),
-        ]);
-        for (const row of lcRows) {
-          const det = extMap[row.forward_pick_item] || {};
-          results.push({
-            source:           'location',
-            item:             row.forward_pick_item,
-            item_description: det.item_description     || '',
-            package_code:     det.external_item_uom    || '',
-            location:         row.location,
-            type_description: 'Home / Forward Pick',
-            pyxis_id:         pyxisMap[row.forward_pick_item] || null,
-          });
-        }
-      }
-    }
-
-    // ── Step 3: Pyxis ID search ──
-    if (results.length === 0) {
-      debugLog('fallback', 'trying Pyxis ID search');
-      const extRows = await queryPyxisByExternalItem(query, system);
-
-      if (extRows.length > 0) {
-        const items = [...new Set(extRows.map(r => r.item).filter(Boolean))];
-        const ivMap = await batchGetInventoryByItems(items, currentSite);
-        for (const row of extRows) {
-          const inv = ivMap[row.item];
-          results.push({
-            source:           inv ? 'inventory' : 'pyxis_lookup',
-            item:             row.item,
-            item_description: row.item_description          || (inv && inv.item_description) || '',
-            package_code:     (inv && inv.package_code)     || '',
-            location:         (inv && inv.actual_location)  || '—',
-            type_description: (inv && inv.type_description) || 'Pyxis Match',
-            pyxis_id:         row.external_item,
-          });
-        }
-      }
-    }
-
-    debugLog('results', results.length);
     renderResults(results, query);
 
   } catch (err) {
@@ -313,21 +178,17 @@ async function performSearch(query) {
 /* ─────────────────────────────────────────────
    RENDER
 ───────────────────────────────────────────── */
-
-// Returns a numeric sort priority: lower = higher in list
-// Forward Pick / Home locations always sort above FIFO
 function locationSortPriority(r) {
   const t = (r.type_description || '').toLowerCase();
   if (t.includes('forward pick') || t.includes('home') || r.source === 'location') return 0;
-  return 1; // FIFO and everything else
+  return 1;
 }
 
 function badgeFor(typeDesc, source) {
   const t = (typeDesc || '').toLowerCase();
-  if (t.includes('forward pick') && source === 'inventory') return ['Forward Pick',  'badge-fp'];
-  if (t.includes('first in') || t.includes('fifo'))        return ['FIFO',          'badge-fifo'];
-  if (t.includes('home') || source === 'location')         return ['Home Location', 'badge-home'];
-  if (source === 'pyxis_lookup')                           return ['Pyxis Match',   'badge-fp'];
+  if (t.includes('forward pick')) return ['Forward Pick',  'badge-fp'];
+  if (t.includes('first in') || t.includes('fifo')) return ['FIFO', 'badge-fifo'];
+  if (t.includes('home')) return ['Home Location', 'badge-home'];
   return [typeDesc || 'Inventory', 'badge-fifo'];
 }
 
@@ -349,27 +210,24 @@ function renderResults(results, query) {
     return;
   }
 
-  // ── Group by item number ──
-  const groups = new Map(); // item# -> { meta, rows[] }
+  const groups = new Map();
   for (const r of results) {
     if (!groups.has(r.item)) {
       groups.set(r.item, {
-        item:             r.item,
+        item:              r.item,
         item_description: r.item_description,
-        package_code:     r.package_code,
-        pyxis_id:         r.pyxis_id,
-        rows:             [],
+        package_code:      r.package_code,
+        pyxis_id:          r.pyxis_id,
+        rows:              [],
       });
     }
     const g = groups.get(r.item);
-    // Prefer non-empty values for item-level metadata
     if (!g.item_description && r.item_description) g.item_description = r.item_description;
     if (!g.package_code     && r.package_code)     g.package_code     = r.package_code;
     if (!g.pyxis_id         && r.pyxis_id)         g.pyxis_id         = r.pyxis_id;
     g.rows.push(r);
   }
 
-  // Sort each group: Forward Pick / Home first, FIFO below
   for (const g of groups.values()) {
     g.rows.sort((a, b) => locationSortPriority(a) - locationSortPriority(b));
   }
@@ -402,7 +260,7 @@ function renderResults(results, query) {
             <div class="result-item-desc">${escHtml(desc)}</div>
             <div class="result-item-meta">
               <span class="result-item-num">Item #: ${escHtml(g.item)}</span>
-              ${pkg ? `<span class="result-item-pkg">NDC: ${escHtml(pkg)}</span>` : ''}
+              ${pkg ? `<span class="result-item-pkg">UOM: ${escHtml(pkg)}</span>` : ''}
             </div>
           </div>
           <div class="result-pyxis-block">
